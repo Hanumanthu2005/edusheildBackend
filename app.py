@@ -48,7 +48,16 @@ def create_app():
     app.config["JWT_ACCESS_TOKEN_EXPIRES"] = timedelta(hours=5)
 
     db.init_app(app)
-    CORS(app)
+    CORS(
+        app,
+        resources={r"/api/*": {"origins": [
+            "http://localhost:5173",
+            "https://edusheild-frontend.vercel.app"
+        ]}},
+        allow_headers=["Content-Type", "Authorization"],
+        methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+        supports_credentials=True
+    )
     jwt = JWTManager(app)
 
     with app.app_context():
