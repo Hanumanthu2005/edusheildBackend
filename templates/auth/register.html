@@ -1,0 +1,112 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CheatGuardX - Registration</title>
+
+</head>
+<body>
+
+    <div class="register-container">
+        <h2>Join with us !</h2>
+        
+        <div class="scanner-container">
+            <video id="webcam" autoplay playsinline muted></video>
+            <div class="scanner-overlay" id="scanner-overlay"></div>
+        </div>
+        
+        <button type="button" id="snap-btn" class="snap-btn">📸 Snap Baseline Photo</button>
+        <div id="snap-status">✔ Baseline Photo Captured!</div>
+
+        {% if error %}
+            <div class="error-msg">⚠ {{ error }}</div>
+        {% endif %}
+        
+        <form id="register-form" action="/register" method="POST">
+            <div class="input-group">
+                <input type="text" name="username" placeholder="Username" required autocomplete="off">
+            </div>
+            <div class="input-group">
+                <input type="email" name="email" placeholder="Email Address" required autocomplete="off">
+            </div>
+            <div class="input-group">
+                <input type="password" name="password" placeholder="Password" required>
+            </div>
+            
+            <input type="hidden" id="register-snapshot-input" name="register_snapshot_base64">
+
+            <button type="submit" class="register-btn">Register Identity</button>
+        </form>
+
+        <a href="/" class="login-link">Already have an account? Login here</a>
+    </div>
+
+    <script>
+        const video = document.getElementById('webcam');
+        const snapBtn = document.getElementById('snap-btn');
+        const snapStatus = document.getElementById('snap-status');
+        const scannerOverlay = document.getElementById('scanner-overlay');
+        const form = document.getElementById('register-form');
+        const registerSnapshotInput = document.getElementById('register-snapshot-input');
+
+        // Initialize Webcam
+        navigator.mediaDevices.getUserMedia({ video: true })
+            .then(stream => {
+                video.srcObject = stream;
+            })
+            .catch(err => {
+                console.error("Camera access denied:", err);
+                alert("Camera access is required for biometric registration.");
+            });
+
+        // Handle the explicit photo snap
+        snapBtn.addEventListener('click', () => {
+            if (video.videoWidth === 0) {
+                alert("Camera is still initializing. Please wait a second.");
+                return;
+            }
+
+            // If the user is retaking the photo, resume the video
+            if (video.paused) {
+                video.play();
+                snapBtn.innerText = "📸 Snap Baseline Photo";
+                snapStatus.style.display = "none";
+                scannerOverlay.style.display = "block";
+                registerSnapshotInput.value = ""; // Clear the old photo
+                return;
+            }
+
+            // Capture the frame
+            const canvas = document.createElement('canvas');
+            canvas.width = video.videoWidth || 640;
+            canvas.height = video.videoHeight || 480;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+            
+            // Convert to Base64
+            const dataURL = canvas.toDataURL('image/jpeg', 0.9);
+            
+            if (dataURL && dataURL.length > 100) {
+                registerSnapshotInput.value = dataURL; // Save it to the form
+                
+                // Visual feedback: Freeze the video and update UI
+                video.pause();
+                scannerOverlay.style.display = "none";
+                snapStatus.style.display = "block";
+                snapBtn.innerText = "🔄 Retake Photo";
+            } else {
+                alert("Failed to capture photo. Please try again.");
+            }
+        });
+
+        // Strictly prevent form submission if they haven't snapped a photo
+        form.addEventListener('submit', function(e) {
+            if (!registerSnapshotInput.value) {
+                e.preventDefault(); 
+                alert("Please click 'Snap Baseline Photo' before registering your identity!");
+            }
+        });
+    </script>
+</body>
+</html>
