@@ -3,6 +3,36 @@ from flask_sqlalchemy import SQLAlchemy
 
 db = SQLAlchemy()
 
+"""
+NEW MODEL — Add this class to your existing models.py
+======================================================
+Also run:  flask db migrate -m "add feedback_log"
+           flask db upgrade
+"""
+
+# from datetime import datetime
+# from .db import db   # adjust import to match your models.py pattern
+
+
+class FeedbackLog(db.Model):
+    __tablename__ = "feedback_log"
+
+    id                = db.Column(db.Integer, primary_key=True)
+    session_id        = db.Column(db.Integer, db.ForeignKey("exam_sessions.id"), nullable=False, unique=True)
+    admin_id          = db.Column(db.Integer, db.ForeignKey("users.id"), nullable=False)
+    is_false_positive = db.Column(db.Boolean, nullable=False)
+    note              = db.Column(db.Text,    nullable=True)
+    violation_type    = db.Column(db.String(64), nullable=True)
+    thresholds_after  = db.Column(db.Text, nullable=True)
+    created_at        = db.Column(db.DateTime, default=datetime.utcnow)
+
+    session = db.relationship("ExamSession", backref=db.backref("feedback", uselist=False))
+    admin   = db.relationship("User", foreign_keys=[admin_id])
+
+    def __repr__(self):
+        kind = "FALSE_POS" if self.is_false_positive else "CONFIRMED"
+        return f"<FeedbackLog session={self.session_id} type={kind}>"
+
 
 # ==========================================================
 # 👤 USER

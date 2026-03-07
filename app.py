@@ -1,11 +1,14 @@
 import os
-import cv2
+import csv
+import io
 import time
 import base64
 import numpy as np
+from collections import Counter
 from datetime import timedelta, datetime
 from functools import wraps
 
+import cv2
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from flask_jwt_extended import (
@@ -30,7 +33,7 @@ from core.audio import AudioMonitor
 from core.face_auth import verify_identity, validate_registration_photo
 
 
-# Per-session cooldown tracker: {  "session_id:violation_type" : last_log_time  }
+# Per-session cooldown tracker: { "session_id:violation_type" : last_log_time }
 last_db_log_time: dict[str, float] = {}
 
 
@@ -131,7 +134,6 @@ def create_app():
         now = time.time()
         key = f"{session.id}:{v_type}"
 
-        # Phone and other instant-terminate violations bypass cooldown
         if v_type not in INSTANT_TERMINATE_VIOLATIONS:
             if now - last_db_log_time.get(key, 0) < 10:
                 return False
@@ -143,9 +145,17 @@ def create_app():
             detail         = detail,
             snapshot_b64   = snapshot,
         ))
-        session.total_warnings      = (session.total_warnings or 0) + 1
-        last_db_log_time[key]       = now
+        session.total_warnings  = (session.total_warnings or 0) + 1
+        last_db_log_time[key]   = now
         return True
+
+    def _grade(score):
+        if score >= 90: return "A+"
+        if score >= 80: return "A"
+        if score >= 70: return "B"
+        if score >= 60: return "C"
+        if score >= 50: return "D"
+        return "F"
 
     # ==========================================================
     # 🔐 ROLE-BASED DECORATOR
@@ -268,6 +278,59 @@ def create_app():
             "session_id": session.id,
         }), 200
 
+
+    @app.route("/api/verify_face", methods=["POST"])
+    @jwt_required()
+    def verify_face():
+        """
+        Pre-exam face verification.
+
+        Accepts a base64 live snapshot, compares it against the user's
+        registered baseline photo using ArcFace, and returns pass/fail.
+
+        Request JSON:
+            { "live_snapshot_base64": "<data-uri or raw base64>" }
+
+        Response JSON (200):
+            { "verified": true/false, "message": "..." }
+        """
+        user_id  = int(get_jwt_identity())
+        data     = request.json or {}
+        snapshot = data.get("live_snapshot_base64", "")
+
+        user = User.query.get(user_id)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+
+        if not snapshot or len(snapshot) <= 100:
+            return jsonify({"verified": False, "message": "No snapshot provided"}), 400
+
+        if not user.registered_face_path or not os.path.exists(user.registered_face_path):
+            return jsonify({"verified": False, "message": "No registered face on file"}), 400
+
+        temp_path = os.path.join(
+            app.config["UPLOAD_FOLDER"],
+            f"temp_examverify_{user_id}_{int(time.time())}.jpg",
+        )
+        try:
+            if not _decode_and_save_image(snapshot, temp_path):
+                return jsonify({"verified": False, "message": "Failed to process snapshot"}), 400
+
+            verified = verify_identity(user.registered_face_path, temp_path)
+            return jsonify({
+                "verified": verified,
+                "message":  "Identity confirmed" if verified else
+                            "Face verification failed. Please ensure good lighting and look directly at the camera.",
+            }), 200
+
+        except Exception as e:
+            print(f"[VERIFY FACE ERROR] {e}")
+            return jsonify({"verified": False, "message": "Verification error"}), 500
+
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
     # ==========================================================
     # 📹 MJPEG VIDEO STREAM  — annotated backend feed
     # ==========================================================
@@ -276,17 +339,12 @@ def create_app():
     def video_feed():
         """
         MJPEG stream of the annotated webcam feed.
-
-        Auth: token passed as query param ?token=<jwt>  (EventSource / <img> can't
-        set headers, so we accept the token in the URL and validate it manually).
-
-        The client replaces the plain <video> element with:
-            <img src="http://localhost:5001/api/video_feed?token=<jwt>" />
+        Auth: token passed as query param ?token=<jwt>
         """
         token = request.args.get("token", "")
         try:
-            decoded   = decode_token(token)
-            user_id   = int(decoded["sub"])
+            decoded = decode_token(token)
+            user_id = int(decoded["sub"])
         except Exception:
             return jsonify({"error": "Invalid or missing token"}), 401
 
@@ -297,7 +355,6 @@ def create_app():
             cap.set(cv2.CAP_PROP_FPS, 15)
 
             if not cap.isOpened():
-                # Send a single error frame then stop
                 error_frame = np.zeros((480, 640, 3), dtype=np.uint8)
                 cv2.putText(error_frame, "Camera not available", (80, 240),
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
@@ -309,7 +366,6 @@ def create_app():
             try:
                 while True:
                     with app.app_context():
-                        # Stop streaming if session was terminated
                         s = (
                             ExamSession.query
                             .filter_by(user_id=user_id)
@@ -323,12 +379,9 @@ def create_app():
                     if not ret:
                         break
 
-                    # Mirror so student sees natural view
                     frame = cv2.flip(frame, 1)
-
                     annotated, violations = analyze_frame(frame)
 
-                    # Log any violations discovered during streaming
                     if violations:
                         with app.app_context():
                             s = (
@@ -349,11 +402,9 @@ def create_app():
                                     )
                                     if logged:
                                         needs_commit = True
-                                        # Immediate termination for phone
                                         if v["type"] in INSTANT_TERMINATE_VIOLATIONS:
                                             s.status   = "terminated"
                                             s.end_time = datetime.utcnow()
-
                                 if needs_commit:
                                     db.session.commit()
 
@@ -362,8 +413,7 @@ def create_app():
                     yield (b"--frame\r\n"
                            b"Content-Type: image/jpeg\r\n\r\n" +
                            buf.tobytes() + b"\r\n")
-
-                    time.sleep(1 / 15)   # ~15 fps
+                    time.sleep(1 / 15)
 
             finally:
                 cap.release()
@@ -506,8 +556,8 @@ def create_app():
         for attempt in UserExam.query.filter_by(
             user_id=user_id, status="completed"
         ).all():
-            exam  = attempt.exam
-            raw   = attempt.score
+            exam   = attempt.exam
+            raw    = attempt.score
             date_s = attempt.end_time or attempt.start_time
             dur_s  = (
                 f"{int((attempt.end_time - attempt.start_time).total_seconds() / 60)} mins"
@@ -611,10 +661,10 @@ def create_app():
             db.session.commit()
 
         response_payload = {
-            "violations":       [v["type"] for v in violations],
+            "violations":        [v["type"] for v in violations],
             "instant_terminate": instant_terminate,
             "terminate_reason":  terminate_reason,
-            "annotated_frame":  encode_annotated_frame(_annotated),
+            "annotated_frame":   encode_annotated_frame(_annotated),
         }
         return jsonify(response_payload), 200
 
@@ -672,7 +722,7 @@ def create_app():
         }), 200
 
     # ==========================================================
-    # 📊 ADMIN ROUTES
+    # 📊 ADMIN — EXAM MANAGEMENT
     # ==========================================================
 
     @app.route("/api/admin/exams", methods=["POST"])
@@ -770,6 +820,10 @@ def create_app():
         db.session.commit()
         return jsonify({"message": "Option added"})
 
+    # ==========================================================
+    # 📊 ADMIN — SESSION MANAGEMENT
+    # ==========================================================
+
     @app.route("/api/admin/sessions/active")
     @admin_required
     def active_sessions():
@@ -793,13 +847,108 @@ def create_app():
         db.session.commit()
         return jsonify({"message": "Session terminated"})
 
-    @app.route("/api/admin/exams/<int:exam_id>/results")
+    @app.route("/api/admin/sessions/<int:session_id>/violations", methods=["GET"])
     @admin_required
-    def exam_results(exam_id):
+    def admin_session_violations(session_id):
+        include_snapshot = request.args.get("include_snapshot", "0") == "1"
+        logs = (
+            ViolationLog.query
+            .filter_by(session_id=session_id)
+            .order_by(ViolationLog.timestamp.asc())
+            .all()
+        )
         return jsonify([
-            {"student": a.user.username, "score": a.score, "status": a.status}
-            for a in UserExam.query.filter_by(exam_id=exam_id).all()
-        ])
+            {
+                "id":             log.id,
+                "violation_type": log.violation_type,
+                "severity":       log.severity,
+                "detail":         log.detail,
+                "timestamp":      log.timestamp.isoformat(),
+                **({"snapshot": log.snapshot_b64} if include_snapshot else {}),
+            }
+            for log in logs
+        ]), 200
+
+    @app.route("/api/admin/sessions/<int:session_id>/detail", methods=["GET"])
+    @admin_required
+    def admin_session_detail(session_id):
+        """
+        Full detail for a single session including all violations and
+        the linked exam attempt. Used by AdminSessionPage detail panel.
+        """
+        include_snapshot = request.args.get("include_snapshot", "0") == "1"
+        s = ExamSession.query.get_or_404(session_id)
+
+        logs = (
+            ViolationLog.query
+            .filter_by(session_id=session_id)
+            .order_by(ViolationLog.timestamp.asc())
+            .all()
+        )
+
+        violation_summary = {}
+        for log in logs:
+            violation_summary[log.violation_type] = (
+                violation_summary.get(log.violation_type, 0) + 1
+            )
+
+        duration_secs = None
+        if s.start_time and s.end_time:
+            duration_secs = int((s.end_time - s.start_time).total_seconds())
+
+        exam_attempt = (
+            UserExam.query
+            .filter_by(user_id=s.user_id)
+            .filter(UserExam.status.in_(["completed", "terminated"]))
+            .order_by(
+                func.abs(
+                    func.strftime("%s", UserExam.start_time) -
+                    func.strftime("%s", s.start_time)
+                )
+            )
+            .first()
+        )
+
+        exam_data = None
+        if exam_attempt:
+            raw   = exam_attempt.score or 0
+            total = exam_attempt.exam.total_marks or 100
+            exam_data = {
+                "id":             exam_attempt.id,
+                "exam_title":     exam_attempt.exam.title,
+                "score":          round(raw, 2),
+                "marks_obtained": round((raw / 100) * total),
+                "total_marks":    total,
+                "status":         exam_attempt.status,
+            }
+
+        return jsonify({
+            "id":                session_id,
+            "user_id":           s.user_id,
+            "student":           s.student.username,
+            "status":            s.status,
+            "start_time":        s.start_time.isoformat() if s.start_time else None,
+            "end_time":          s.end_time.isoformat()   if s.end_time   else None,
+            "duration_seconds":  duration_secs,
+            "total_warnings":    s.total_warnings or 0,
+            "violation_summary": violation_summary,
+            "exam_attempt":      exam_data,
+            "violations": [
+                {
+                    "id":             log.id,
+                    "violation_type": log.violation_type,
+                    "severity":       log.severity or "major",
+                    "detail":         log.detail,
+                    "timestamp":      log.timestamp.isoformat(),
+                    **({"snapshot_b64": log.snapshot_b64} if include_snapshot else {}),
+                }
+                for log in logs
+            ],
+        }), 200
+
+    # ==========================================================
+    # 📊 ADMIN — VIOLATION MANAGEMENT
+    # ==========================================================
 
     @app.route("/api/admin/violations", methods=["GET"])
     @admin_required
@@ -850,54 +999,561 @@ def create_app():
             for r in rows
         ]), 200
 
-    @app.route("/api/admin/sessions/<int:session_id>/violations", methods=["GET"])
+    # ==========================================================
+    # 📊 ADMIN — RESULTS
+    # ==========================================================
+
+    @app.route("/api/admin/exams/<int:exam_id>/results")
     @admin_required
-    def admin_session_violations(session_id):
-        include_snapshot = request.args.get("include_snapshot", "0") == "1"
-        logs = (
-            ViolationLog.query
-            .filter_by(session_id=session_id)
-            .order_by(ViolationLog.timestamp.asc())
+    def exam_results(exam_id):
+        return jsonify([
+            {"student": a.user.username, "score": a.score, "status": a.status}
+            for a in UserExam.query.filter_by(exam_id=exam_id).all()
+        ])
+
+    @app.route("/api/admin/results/all", methods=["GET"])
+    @admin_required
+    def admin_all_results():
+        """
+        Returns every UserExam attempt (all exams, all students) together with
+        an aggregate summary object used for the stat-cards and charts.
+
+        Query params (all optional):
+            exam_id   – filter to a single exam
+            student   – case-insensitive username substring search
+            status    – 'Pass' | 'Fail' | 'terminated' | 'in_progress'
+            page      – 1-based page number (default: 1)
+            per_page  – rows per page (default: 200, max: 500)
+        """
+        exam_id_filter = request.args.get("exam_id",  type=int)
+        student_filter = request.args.get("student",  "").strip().lower()
+        status_filter  = request.args.get("status",   "").strip()
+        page_num       = max(request.args.get("page",     1,   type=int), 1)
+        per_page       = min(request.args.get("per_page", 200, type=int), 500)
+
+        q = (
+            db.session.query(UserExam)
+            .join(User, UserExam.user_id == User.id)
+            .join(Exam, UserExam.exam_id == Exam.id)
+        )
+
+        if exam_id_filter:
+            q = q.filter(UserExam.exam_id == exam_id_filter)
+        if student_filter:
+            q = q.filter(func.lower(User.username).contains(student_filter))
+        if status_filter in ("Pass", "Fail"):
+            q = q.filter(UserExam.status == "completed")
+        elif status_filter == "terminated":
+            q = q.filter(UserExam.status == "terminated")
+        elif status_filter == "in_progress":
+            q = q.filter(UserExam.status == "in_progress")
+
+        total_count = q.count()
+        attempts    = (
+            q.order_by(UserExam.start_time.desc())
+             .offset((page_num - 1) * per_page)
+             .limit(per_page)
+             .all()
+        )
+
+        viol_rows = (
+            db.session.query(
+                ExamSession.user_id,
+                func.count(ViolationLog.id).label("cnt"),
+            )
+            .join(ViolationLog, ViolationLog.session_id == ExamSession.id)
+            .group_by(ExamSession.user_id)
             .all()
         )
-        return jsonify([
-            {
-                "id":             log.id,
-                "violation_type": log.violation_type,
-                "severity":       log.severity,
-                "detail":         log.detail,
-                "timestamp":      log.timestamp.isoformat(),
-                **({"snapshot": log.snapshot_b64} if include_snapshot else {}),
-            }
-            for log in logs
-        ]), 200
+        viol_map = {r.user_id: r.cnt for r in viol_rows}
+
+        def _status(attempt):
+            if attempt.status == "terminated":  return "terminated"
+            if attempt.status == "in_progress": return "in_progress"
+            return "Pass" if (attempt.score or 0) >= 50 else "Fail"
+
+        def _duration(attempt):
+            if attempt.start_time and attempt.end_time:
+                mins = int((attempt.end_time - attempt.start_time).total_seconds() / 60)
+                return f"{mins} min{'s' if mins != 1 else ''}"
+            return f"{attempt.exam.duration_minutes} mins"
+
+        results = []
+        for a in attempts:
+            st = _status(a)
+            if status_filter in ("Pass", "Fail") and st != status_filter:
+                continue
+            raw_score      = a.score or 0
+            total_marks    = a.exam.total_marks or 100
+            marks_obtained = round((raw_score / 100) * total_marks)
+            results.append({
+                "id":             a.id,
+                "student_id":     a.user_id,
+                "student":        a.user.username,
+                "exam_id":        a.exam_id,
+                "exam_title":     a.exam.title,
+                "score":          round(raw_score, 2),
+                "marks_obtained": marks_obtained,
+                "total_marks":    total_marks,
+                "questions":      len(a.exam.questions),
+                "status":         st,
+                "date":           (a.end_time or a.start_time).strftime("%Y-%m-%d")
+                                  if (a.end_time or a.start_time) else "N/A",
+                "duration":       _duration(a),
+                "violations":     viol_map.get(a.user_id, 0),
+            })
+
+        all_attempts = q.all()
+        completed    = [a for a in all_attempts if a.status == "completed"]
+        scores       = [a.score for a in completed if a.score is not None]
+        pass_c       = sum(1 for a in completed if (a.score or 0) >= 50)
+        fail_c       = sum(1 for a in completed if (a.score or 0) <  50)
+        term_c       = sum(1 for a in all_attempts if a.status == "terminated")
+        avg_s        = sum(scores) / len(scores) if scores else 0
+        pass_r       = (pass_c / (pass_c + fail_c) * 100) if (pass_c + fail_c) else 0
+
+        exam_counts = Counter(a.exam.title for a in all_attempts)
+        top_exam    = exam_counts.most_common(1)[0][0] if exam_counts else None
+
+        return jsonify({
+            "results": results,
+            "summary": {
+                "total_attempts":   len(all_attempts),
+                "avg_score":        round(avg_s, 2),
+                "pass_count":       pass_c,
+                "fail_count":       fail_c,
+                "terminated_count": term_c,
+                "pass_rate":        round(pass_r, 2),
+                "top_exam":         top_exam,
+                "highest_score":    round(max(scores), 2) if scores else None,
+                "lowest_score":     round(min(scores), 2) if scores else None,
+            },
+            "total_count": total_count,
+            "page":        page_num,
+            "per_page":    per_page,
+        }), 200
+
+    @app.route("/api/admin/results/export", methods=["GET"])
+    @admin_required
+    def admin_export_results():
+        """Returns all completed/terminated exam attempts as a CSV download."""
+        exam_id_filter = request.args.get("exam_id",  type=int)
+        student_filter = request.args.get("student",  "").strip().lower()
+        status_filter  = request.args.get("status",   "").strip()
+
+        q = (
+            db.session.query(UserExam)
+            .join(User, UserExam.user_id == User.id)
+            .join(Exam, UserExam.exam_id == Exam.id)
+            .filter(UserExam.status.in_(["completed", "terminated"]))
+        )
+        if exam_id_filter:
+            q = q.filter(UserExam.exam_id == exam_id_filter)
+        if student_filter:
+            q = q.filter(func.lower(User.username).contains(student_filter))
+
+        attempts = q.order_by(UserExam.start_time.desc()).all()
+
+        viol_rows = (
+            db.session.query(
+                ExamSession.user_id,
+                func.count(ViolationLog.id).label("cnt"),
+            )
+            .join(ViolationLog, ViolationLog.session_id == ExamSession.id)
+            .group_by(ExamSession.user_id)
+            .all()
+        )
+        viol_map = {r.user_id: r.cnt for r in viol_rows}
+
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "Student", "Exam", "Score (%)", "Marks Obtained", "Total Marks",
+            "Status", "Grade", "Date", "Duration (mins)", "Violations",
+        ])
+
+        for a in attempts:
+            raw       = a.score or 0
+            total_m   = a.exam.total_marks or 100
+            marks_obt = round((raw / 100) * total_m)
+            status    = "terminated" if a.status == "terminated" else ("Pass" if raw >= 50 else "Fail")
+            dur_mins  = int((a.end_time - a.start_time).total_seconds() / 60) \
+                        if a.start_time and a.end_time else 0
+
+            if status_filter and status != status_filter:
+                continue
+
+            writer.writerow([
+                a.user.username, a.exam.title,
+                round(raw, 2), marks_obt, total_m,
+                status, _grade(raw),
+                (a.end_time or a.start_time).strftime("%Y-%m-%d")
+                    if (a.end_time or a.start_time) else "",
+                dur_mins,
+                viol_map.get(a.user_id, 0),
+            ])
+
+        output.seek(0)
+        return Response(
+            output.getvalue(),
+            mimetype="text/csv",
+            headers={"Content-Disposition": "attachment; filename=edushield_results.csv"},
+        )
+
+    # ==========================================================
+    # 📊 ADMIN — STUDENT PROFILES, SESSIONS & VIOLATIONS
+    # ==========================================================
+
+    @app.route("/api/admin/students/<int:student_id>/profile", methods=["GET"])
+    @admin_required
+    def admin_student_profile(student_id):
+        """Returns basic profile info for a student."""
+        user = User.query.get_or_404(student_id)
+        return jsonify({
+            "id":              user.id,
+            "username":        user.username,
+            "role":            user.role,
+            "registered_face": bool(user.registered_face_path),
+        }), 200
 
     @app.route("/api/admin/students/<int:student_id>/violations", methods=["GET"])
     @admin_required
     def admin_student_violations(student_id):
+        """
+        Returns all violation logs for a student across all (or one) sessions.
+
+        Query params:
+            session_id        – filter to a single session
+            type              – filter by violation_type
+            severity          – filter by severity
+            include_snapshot  – 1 to include snapshot_b64 (default 0)
+            limit             – max rows (default 500, max 2000)
+        """
+        session_id_filter = request.args.get("session_id", type=int)
+        type_filter       = request.args.get("type", "").strip()
+        severity_filter   = request.args.get("severity", "").strip()
+        include_snapshot  = request.args.get("include_snapshot", "0") == "1"
+        limit             = min(request.args.get("limit", 500, type=int), 2000)
+
         sessions    = ExamSession.query.filter_by(user_id=student_id).all()
         session_ids = [s.id for s in sessions]
         if not session_ids:
             return jsonify([]), 200
 
-        logs = (
-            ViolationLog.query
-            .filter(ViolationLog.session_id.in_(session_ids))
-            .order_by(ViolationLog.timestamp.desc())
-            .all()
-        )
+        q = ViolationLog.query.filter(ViolationLog.session_id.in_(session_ids))
+
+        if session_id_filter and session_id_filter in session_ids:
+            q = q.filter(ViolationLog.session_id == session_id_filter)
+        if type_filter:
+            q = q.filter(ViolationLog.violation_type == type_filter)
+        if severity_filter:
+            q = q.filter(ViolationLog.severity == severity_filter)
+
+        logs = q.order_by(ViolationLog.timestamp.desc()).limit(limit).all()
+
         return jsonify([
             {
                 "id":             log.id,
                 "session_id":     log.session_id,
                 "violation_type": log.violation_type,
-                "severity":       log.severity,
+                "severity":       log.severity or "major",
                 "detail":         log.detail,
                 "timestamp":      log.timestamp.isoformat(),
+                **({"snapshot_b64": log.snapshot_b64} if include_snapshot else {}),
             }
             for log in logs
         ]), 200
 
+    @app.route("/api/admin/students/<int:student_id>/sessions", methods=["GET"])
+    @admin_required
+    def admin_student_sessions(student_id):
+
+        """
+        Returns all exam sessions for a student, enriched with violation
+        summary, linked exam attempt score, and duration.
+        """
+        User.query.get_or_404(student_id)
+
+        sessions = (
+            ExamSession.query
+            .filter_by(user_id=student_id)
+            .order_by(ExamSession.start_time.desc())
+            .all()
+        )
+
+        result = []
+        for s in sessions:
+            viol_rows = (
+                db.session.query(
+                    ViolationLog.violation_type,
+                    func.count(ViolationLog.id).label("cnt"),
+                )
+                .filter(ViolationLog.session_id == s.id)
+                .group_by(ViolationLog.violation_type)
+                .all()
+            )
+            violation_summary = {r.violation_type: r.cnt for r in viol_rows}
+
+            recent_viols = (
+                ViolationLog.query
+                .filter_by(session_id=s.id)
+                .order_by(ViolationLog.timestamp.desc())
+                .limit(20)
+                .all()
+            )
+
+            exam_attempt = (
+                UserExam.query
+                .filter_by(user_id=student_id)
+                .filter(UserExam.status.in_(["completed", "terminated"]))
+                .order_by(
+                    func.abs(
+                        func.strftime("%s", UserExam.start_time) -
+                        func.strftime("%s", s.start_time)
+                    )
+                )
+                .first()
+            )
+
+            exam_attempt_data = None
+            if exam_attempt:
+                raw   = exam_attempt.score or 0
+                total = exam_attempt.exam.total_marks or 100
+                exam_attempt_data = {
+                    "id":             exam_attempt.id,
+                    "exam_id":        exam_attempt.exam_id,
+                    "exam_title":     exam_attempt.exam.title,
+                    "score":          round(raw, 2),
+                    "marks_obtained": round((raw / 100) * total),
+                    "total_marks":    total,
+                    "status":         exam_attempt.status,
+                }
+
+            duration_secs = None
+            if s.start_time and s.end_time:
+                duration_secs = int((s.end_time - s.start_time).total_seconds())
+
+            result.append({
+                "id":                s.id,
+                "user_id":           s.user_id,
+                "status":            s.status,
+                "start_time":        s.start_time.isoformat() if s.start_time else None,
+                "end_time":          s.end_time.isoformat()   if s.end_time   else None,
+                "duration_seconds":  duration_secs,
+                "total_warnings":    s.total_warnings or 0,
+                "violation_summary": violation_summary,
+                "violations": [
+                    {
+                        "violation_type": v.violation_type,
+                        "severity":       v.severity,
+                        "timestamp":      v.timestamp.isoformat(),
+                    }
+                    for v in recent_viols
+                ],
+                "exam_score":   exam_attempt_data["score"] if exam_attempt_data else None,
+                "exam_attempt": exam_attempt_data,
+            })
+
+        return jsonify(result), 200
+
+
+    """
+    RL FEEDBACK ROUTES  — paste these into your existing create_app() in app.py
+    =============================================================================
+    Place them after the existing admin routes (e.g. after admin_violation_summary).
+
+    Also add this import at the top of app.py (alongside your other imports):
+        from core.rl_agent import rl_optimizer
+
+    And add this model import at the top:
+        from models import FeedbackLog   # (new model defined below)
+    =============================================================================
+    """
+
+    # ==========================================================
+    # 🧠  RL FEEDBACK — Admin corrects a wrong termination
+    # ==========================================================
+
+    @app.route("/api/admin/feedback", methods=["POST"])
+    @admin_required
+    def submit_rl_feedback():
+        """
+        Admin tells the system whether a session termination was correct.
+
+        Request JSON:
+        {
+            "session_id":       123,
+            "is_false_positive": true,      // true  = system was WRONG (not cheating)
+                                            // false = system was CORRECT (real cheat)
+            "note":             "Student was adjusting glasses",   // optional
+            "violation_type":   "looking_away"                     // optional hint
+        }
+
+        Response JSON:
+        {
+            "success":          true,
+            "message":          "...",
+            "updated_thresholds": { "yolo": 0.55, "pose": 0.25, "audio": 800 },
+            "action_taken":     "YOLO_THRESH_UP",
+            "accuracy":         0.82
+        }
+        """
+        admin_id = int(get_jwt_identity())
+        data     = request.json or {}
+
+        session_id       = data.get("session_id")
+        is_false_positive = data.get("is_false_positive")
+        note             = data.get("note", "")
+        hint_vtype       = data.get("violation_type", "")
+
+        if session_id is None or is_false_positive is None:
+            return jsonify({"error": "session_id and is_false_positive are required"}), 400
+
+        session = ExamSession.query.get(session_id)
+        if not session:
+            return jsonify({"error": "Session not found"}), 404
+
+        # Prevent double-feedback on same session
+        existing = FeedbackLog.query.filter_by(session_id=session_id).first()
+        if existing:
+            return jsonify({"error": "Feedback already submitted for this session"}), 409
+
+        # ── Determine the primary violation type for RL context ──────────────────
+        if hint_vtype:
+            primary_violation = hint_vtype
+        else:
+            # Pick the most-frequent violation from this session
+            row = (
+                db.session.query(
+                    ViolationLog.violation_type,
+                    func.count(ViolationLog.id).label("cnt"),
+                )
+                .filter(ViolationLog.session_id == session_id)
+                .group_by(ViolationLog.violation_type)
+                .order_by(func.count(ViolationLog.id).desc())
+                .first()
+            )
+            primary_violation = row.violation_type if row else "looking_away"
+
+        # ── RL update — reward signal ─────────────────────────────────────────────
+        reward = -1 if is_false_positive else +1
+        rl_result = rl_optimizer.update_thresholds(primary_violation, reward)
+
+        # ── Persist feedback log ──────────────────────────────────────────────────
+        db.session.add(FeedbackLog(
+            session_id        = session_id,
+            admin_id          = admin_id,
+            is_false_positive = is_false_positive,
+            note              = note,
+            violation_type    = primary_violation,
+            thresholds_after  = str(rl_result["thresholds"]),
+        ))
+
+        # If false positive → restore session status so student can resume
+        # (optional: comment out if you want termination to be permanent)
+        if is_false_positive and session.status == "terminated":
+            session.status   = "in_progress"
+            session.end_time = None
+
+        db.session.commit()
+
+        return jsonify({
+            "success":            True,
+            "message":            (
+                "✓ Marked as false positive. System has learned to be less sensitive."
+                if is_false_positive else
+                "✓ Confirmed as real cheating. Detection reinforced."
+            ),
+            "updated_thresholds": rl_result["thresholds"],
+            "action_taken":       rl_result["action_taken"],
+            "accuracy":           rl_result["accuracy"],
+            "epsilon":            rl_result["epsilon"],
+        }), 200
+
+
+    @app.route("/api/admin/feedback/<int:session_id>", methods=["GET"])
+    @admin_required
+    def get_session_feedback(session_id):
+        """Check if feedback has already been given for a session."""
+        log = FeedbackLog.query.filter_by(session_id=session_id).first()
+        if not log:
+            return jsonify({"has_feedback": False}), 200
+        return jsonify({
+            "has_feedback":     True,
+            "is_false_positive": log.is_false_positive,
+            "note":             log.note,
+            "submitted_at":     log.created_at.isoformat() if log.created_at else None,
+        }), 200
+
+
+    @app.route("/api/admin/rl/stats", methods=["GET"])
+    @admin_required
+    def rl_stats():
+        """Returns current RL model accuracy, thresholds, and learning history."""
+        return jsonify(rl_optimizer.get_stats()), 200
+
+
+    @app.route("/api/admin/rl/thresholds", methods=["GET"])
+    @admin_required
+    def rl_thresholds():
+        """Returns just the current detection thresholds."""
+        return jsonify(rl_optimizer.thresholds), 200
+
+
+    @app.route("/api/admin/sessions/terminated", methods=["GET"])
+    @admin_required
+    def terminated_sessions():
+        """
+        Returns recently terminated sessions that have NOT received feedback yet.
+        Used to populate the admin feedback queue.
+
+        Query params:
+            limit  – max rows (default 50)
+        """
+        limit = min(request.args.get("limit", 50, type=int), 200)
+
+        # Sessions that are terminated but have no feedback log
+        feedbacked_ids = [f.session_id for f in FeedbackLog.query.all()]
+
+        q = ExamSession.query.filter_by(status="terminated")
+        if feedbacked_ids:
+            q = q.filter(~ExamSession.id.in_(feedbacked_ids))
+
+        sessions = q.order_by(ExamSession.end_time.desc()).limit(limit).all()
+
+        result = []
+        for s in sessions:
+            # Get primary violation
+            row = (
+                db.session.query(
+                    ViolationLog.violation_type,
+                    func.count(ViolationLog.id).label("cnt"),
+                )
+                .filter(ViolationLog.session_id == s.id)
+                .group_by(ViolationLog.violation_type)
+                .order_by(func.count(ViolationLog.id).desc())
+                .first()
+            )
+            primary_viol = row.violation_type if row else "unknown"
+            total_viols  = (
+                db.session.query(func.count(ViolationLog.id))
+                .filter(ViolationLog.session_id == s.id)
+                .scalar() or 0
+            )
+            result.append({
+                "session_id":       s.id,
+                "student":          s.student.username,
+                "student_id":       s.user_id,
+                "status":           s.status,
+                "start_time":       s.start_time.isoformat() if s.start_time else None,
+                "end_time":         s.end_time.isoformat()   if s.end_time   else None,
+                "total_warnings":   s.total_warnings or 0,
+                "total_violations": total_viols,
+                "primary_violation": primary_viol,
+                "has_feedback":     False,
+            })
+
+        return jsonify(result), 200
     return app
 
 
